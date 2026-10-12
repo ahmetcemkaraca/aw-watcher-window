@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from time import sleep
 
 from aw_client import ActivityWatchClient
+if os.environ.get("PEAKACTIVITY_CAPTURE") == "1":
+    from aw_client.capture import filter_data
 from aw_core.log import setup_logging
 from aw_core.models import Event
 
@@ -50,7 +52,7 @@ def try_compile_title_regex(title):
     try:
         return re.compile(title, re.IGNORECASE)
     except re.error:
-        logger.error(f"Invalid regex pattern: {title}")
+        logger.error("Invalid title exclusion pattern")
         exit(1)
 
 
@@ -148,7 +150,6 @@ def heartbeat_loop(
         current_window = None
         try:
             current_window = get_current_window(strategy)
-            logger.debug(current_window)
         except (FatalError, OSError):
             # Fatal exceptions should quit the program
             try:
@@ -172,6 +173,12 @@ def heartbeat_loop(
         if current_window is None:
             logger.debug("Unable to fetch window, trying again on next poll")
         else:
+            if getattr(client, "capture_policy", None) is not None:
+                current_window = filter_data(client.capture_policy, bucket_id, current_window, datetime.now(timezone.utc))
+                if current_window is None:
+                    client.break_capture_chain(bucket_id)
+                    sleep(poll_time)
+                    continue
             current_window = transform_window(
                 current_window,
                 exclude_title=exclude_title,
@@ -202,7 +209,7 @@ def transform_window(
         return research_transform(current_window, research_category_map)
 
     for pattern in exclude_titles or []:
-        if pattern.search(current_window["title"]):
+        if pattern.search(current_window.get("title", "")):
             current_window["title"] = "excluded"
 
     if exclude_title:
