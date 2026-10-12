@@ -1,3 +1,14 @@
+# PeakActivity capture integration (development)
+
+PeakActivity application identity in the macOS accessibility prompt, renewable local capture credentials, and source-specific capture consent before window events are sent.
+
+Use the matching PeakActivity aw-client source selected by the source graph. An independently installed client version is not an equivalent build input.
+
+This is independent PeakActivity development based on the upstream project.
+PeakActivity is not affiliated with or endorsed by its upstream authors.
+The inherited documentation below describes upstream usage and distributions.
+See [source provenance and license notices](FORKED_FROM.md) for this revision.
+
 aw-watcher-window
 =================
 

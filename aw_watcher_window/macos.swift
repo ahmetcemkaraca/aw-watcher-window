@@ -59,13 +59,137 @@ extension SBObject: SafariWindow {}
 }
 extension SBApplication: SafariApplication {}
 
+// Local credentials stay in memory and never appear in a URL or log message.
+final class NoCaptureRedirects: NSObject, URLSessionTaskDelegate {
+  func urlSession(_ session: URLSession, task: URLSessionTask,
+                  willPerformHTTPRedirection response: HTTPURLResponse,
+                  newRequest request: URLRequest,
+                  completionHandler: @escaping (URLRequest?) -> Void) {
+    completionHandler(nil)
+  }
+}
+
+actor CaptureHTTP {
+  private var token = ProcessInfo.processInfo.environment["PEAKACTIVITY_API_TOKEN"]
+  private let refresh = ProcessInfo.processInfo.environment["PEAKACTIVITY_API_REFRESH"]
+  private let origin = ProcessInfo.processInfo.environment["PEAKACTIVITY_API_ORIGIN"].flatMap(URL.init(string:))
+  private let session: URLSession = {
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = 10
+    config.httpCookieStorage = nil
+    return URLSession(configuration: config, delegate: NoCaptureRedirects(), delegateQueue: nil)
+  }()
+
+  private func validToken(_ value: String) -> Bool {
+    value.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil
+  }
+
+  func upload(_ original: URLRequest, payload: Data) async throws -> HTTPURLResponse {
+    var request = original
+    if let token = token {
+      guard let url = request.url, let origin = origin,
+            url.scheme == "http", origin.scheme == "http",
+            ["localhost", "127.0.0.1", "::1"].contains(url.host ?? ""),
+            ["localhost", "127.0.0.1", "::1"].contains(origin.host ?? ""),
+            url.port == origin.port, validToken(token) else {
+        throw HeartbeatError.error(msg: "Capture credential origin mismatch")
+      }
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+    var (_, response) = try await session.upload(for: request, from: payload)
+    if (response as? HTTPURLResponse)?.statusCode == 401, token != nil,
+       let refresh = refresh, let origin = origin {
+      var renewal = URLRequest(url: origin.appendingPathComponent("api/0/session/refresh"))
+      renewal.httpMethod = "POST"
+      renewal.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      let body = try JSONSerialization.data(withJSONObject: ["refresh_token": refresh])
+      let (data, renewed) = try await session.upload(for: renewal, from: body)
+      if (renewed as? HTTPURLResponse)?.statusCode == 200,
+         let result = try JSONSerialization.jsonObject(with: data) as? [String: String],
+         let replacement = result["access_token"], validToken(replacement) {
+        token = replacement
+        request.setValue("Bearer \(replacement)", forHTTPHeaderField: "Authorization")
+        (_, response) = try await session.upload(for: request, from: payload)
+      }
+    }
+    guard let http = response as? HTTPURLResponse else {
+      throw HeartbeatError.error(msg: "Invalid local server response")
+    }
+    if let replacement = http.value(forHTTPHeaderField: "X-PeakActivity-Token"), validToken(replacement) {
+      token = replacement
+    }
+    return http
+  }
+}
+let captureHTTP = CaptureHTTP()
+
 // AW-specific structs
 
 struct NetworkMessage: Codable, Equatable {
   var app: String
   var title: String?
   var url: String?
+  var incognito: Bool? = nil
+  var capture_break: Bool? = nil
 }
+
+struct CaptureConsent: Decodable {
+  let recording: Bool
+  let paused_until: String?
+  let window: Bool
+  let idle: Bool
+  let browser: Bool
+  let titles: Bool
+  let urls: Bool
+  let paths: Bool
+  let excluded_apps: [String]
+  let excluded_domains: [String]
+  let effective_from: String
+
+  static func date(_ text: String) -> Date? {
+    let parser = ISO8601DateFormatter()
+    parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = parser.date(from: text) { return date }
+    parser.formatOptions = [.withInternetDateTime]
+    return parser.date(from: text)
+  }
+
+  func filter(_ input: NetworkMessage, at time: Date) -> NetworkMessage? {
+    guard recording, let effective = Self.date(effective_from), time >= effective else { return nil }
+    if let until = paused_until {
+      guard let deadline = Self.date(until), Date() >= deadline, time >= deadline else { return nil }
+    }
+    let app = input.app.lowercased()
+    if excluded_apps.contains(where: { app.contains($0) }) { return nil }
+    let isBrowser = input.url != nil || ["chrome", "chromium", "firefox", "safari", "brave", "msedge", "microsoft edge", "opera"].contains(where: { app.contains($0) })
+    if isBrowser && (!browser || input.incognito != false) { return nil }
+    if !isBrowser && !window { return nil }
+    if input.incognito == true { return nil }
+    var output = input
+    if let value = input.url {
+      guard var url = URLComponents(string: value), let host = url.host?.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+            ["http", "https"].contains(url.scheme ?? "") else { return nil }
+      if excluded_domains.contains(where: { host == $0 || host.hasSuffix("." + $0) }) { return nil }
+      url.host = host; url.user = nil; url.password = nil
+      url.path = ""; url.query = nil; url.fragment = nil
+      if (url.scheme == "https" && url.port == 443) || (url.scheme == "http" && url.port == 80) { url.port = nil }
+      output.url = urls ? url.string : nil
+    }
+    if !titles { output.title = nil }
+    return output
+  }
+}
+
+let captureConsent: CaptureConsent? = {
+  guard ProcessInfo.processInfo.environment["PEAKACTIVITY_CAPTURE"] == "1" else { return nil }
+  guard let raw = ProcessInfo.processInfo.environment["PEAKACTIVITY_CAPTURE_POLICY"],
+        let bytes = raw.data(using: .utf8),
+        let consent = try? JSONDecoder().decode(CaptureConsent.self, from: bytes),
+        CaptureConsent.date(consent.effective_from) != nil else {
+    fatalError("Native capture requires a valid policy")
+  }
+  return consent
+}()
 
 struct Heartbeat: Codable {
   var timestamp: Date
@@ -158,7 +282,31 @@ let researchBrowserApps = Set([
 ])
 
 let main = MainThing()
-var oldHeartbeat: Heartbeat?
+private var oldHeartbeat: Heartbeat?
+private var captureEpoch: UInt64 = 0
+private let heartbeatStateLock = NSLock()
+
+func heartbeatSnapshot() -> (Heartbeat?, UInt64) {
+  heartbeatStateLock.lock()
+  defer { heartbeatStateLock.unlock() }
+  return (oldHeartbeat, captureEpoch)
+}
+
+func resetCaptureChain() {
+  heartbeatStateLock.lock()
+  defer { heartbeatStateLock.unlock() }
+  oldHeartbeat = nil
+  captureEpoch &+= 1
+}
+
+func rememberHeartbeat(_ heartbeat: Heartbeat, epoch: UInt64) {
+  heartbeatStateLock.lock()
+  defer { heartbeatStateLock.unlock() }
+  guard epoch == captureEpoch, oldHeartbeat == nil || oldHeartbeat!.timestamp <= heartbeat.timestamp else { return }
+  var stored = heartbeat
+  stored.data.capture_break = nil
+  oldHeartbeat = stored
+}
 
 let encoder = JSONEncoder()
 let formatter = ISO8601DateFormatter()
@@ -177,7 +325,7 @@ func compileExcludeTitlePattern(_ pattern: String) -> NSRegularExpression {
   do {
     return try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
   } catch let regexError {
-    error("Invalid regex pattern: \(pattern) — \(regexError.localizedDescription)")
+    error("Invalid title exclusion pattern")
     exit(1)
   }
 }
@@ -222,7 +370,7 @@ func parseOptionalArguments(_ arguments: ArraySlice<String>) {
       continue
     }
 
-    error("Unknown argument: \(argument)")
+    error("Unknown command-line option")
     exit(1)
   }
 }
@@ -320,17 +468,20 @@ func createBucket() {
     var urlRequest = URLRequest(url: url)
     urlRequest.httpMethod = "POST"
     urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
-    let (_, response) = try await URLSession.shared.upload(for: urlRequest, from: payload)
-    guard (200...299).contains((response as! HTTPURLResponse).statusCode) else {
+    let response = try await captureHTTP.upload(urlRequest, payload: payload)
+    guard (200...299).contains(response.statusCode) else {
       log("Failed to create bucket")
       return
     }
   }
 }
 
-func sendHeartbeat(_ heartbeat: Heartbeat) {
-  let oldPayloadDifferent = oldHeartbeat != nil && oldHeartbeat!.data != heartbeat.data
-  let timeSinceLastHeartbeat = oldHeartbeat != nil ? heartbeat.timestamp.timeIntervalSince(oldHeartbeat!.timestamp) : -1.0
+func sendHeartbeat(_ incoming: Heartbeat) {
+  let (previous, epoch) = heartbeatSnapshot()
+  var heartbeat = incoming
+  if captureConsent != nil && previous == nil { heartbeat.data.capture_break = true }
+  let oldPayloadDifferent = previous != nil && previous!.data != heartbeat.data
+  let timeSinceLastHeartbeat = previous != nil ? heartbeat.timestamp.timeIntervalSince(previous!.timestamp) : -1.0
 
   // if you resize a window a ton of events (subsecond) will be fired
   // we enforce a 1s minimum gap between events to avoid this
@@ -342,6 +493,7 @@ func sendHeartbeat(_ heartbeat: Heartbeat) {
   // TODO running these async could cause weird state issues since the observer stuff can send a log of heartbeats
   //      in a short time under certain circumstances, and we don't want to send them all
   Task {
+    guard heartbeatSnapshot().1 == epoch else { return }
     if oldPayloadDifferent {
       debug("sending old heartbeat for merging")
 
@@ -356,7 +508,7 @@ func sendHeartbeat(_ heartbeat: Heartbeat) {
           // we don't *think* this millisecond subtraction is necessary, but it may be:
           // https://github.com/ActivityWatch/aw-watcher-window/pull/69#discussion_r987064282
           timestamp: heartbeat.timestamp - 0.001,
-          data: oldHeartbeat!.data
+          data: previous!.data
         )
 
         try await sendHeartbeatSingle(refreshedOldHeartbeat, pulsetime: timeSinceLastHeartbeat + 1)
@@ -366,15 +518,16 @@ func sendHeartbeat(_ heartbeat: Heartbeat) {
       }
     }
 
+    guard heartbeatSnapshot().1 == epoch else { return }
     do {
-      let since_last_seconds = oldHeartbeat != nil ? heartbeat.timestamp.timeIntervalSince(oldHeartbeat!.timestamp) : 0
+      let since_last_seconds = previous != nil ? heartbeat.timestamp.timeIntervalSince(previous!.timestamp) : 0
       try await sendHeartbeatSingle(heartbeat, pulsetime: since_last_seconds + 1)
     } catch {
       log("Failed to send heartbeat: \(error)")
       return
     }
 
-    oldHeartbeat = heartbeat
+    rememberHeartbeat(heartbeat, epoch: epoch)
   }
 }
 
@@ -386,13 +539,13 @@ func sendHeartbeatSingle(_ heartbeat: Heartbeat, pulsetime: Double) async throws
   urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
 
   let payload = try! encoder.encode(heartbeat)
-  let (_, response) = try await URLSession.shared.upload(for: urlRequest, from: payload)
+  let response = try await captureHTTP.upload(urlRequest, payload: payload)
 
-  guard (200...299).contains((response as! HTTPURLResponse).statusCode) else {
-    throw HeartbeatError.error(msg: "Failed to send heartbeat: \(response)")
+  guard (200...299).contains(response.statusCode) else {
+    throw HeartbeatError.error(msg: "Local heartbeat was rejected")
   }
 
-  debug("[heartbeat] bucket: \(bucketName), timestamp: \(heartbeat.timestamp), pulsetime: \(round(pulsetime * 10) / 10), app: \(heartbeat.data.app), title: \(heartbeat.data.title ?? ""), url: \(heartbeat.data.url ?? "")")
+  debug("Heartbeat sent")
 }
 
 class MainThing {
@@ -450,6 +603,11 @@ class MainThing {
     let applicationName = frontmost.localizedName ?? frontmost.bundleIdentifier ?? ""
     var data = NetworkMessage(app: applicationName, title: windowTitle as? String ?? "")
 
+    if let consent = captureConsent,
+       (CHROME_BROWSERS.contains(applicationName) || applicationName == "Safari") && !consent.browser {
+      resetCaptureChain()
+      return
+    }
     if CHROME_BROWSERS.contains(applicationName) {
       debug("Chrome browser detected, extracting URL and title")
 
@@ -470,8 +628,10 @@ class MainThing {
       }
 
       if frontWindow.mode == "incognito" {
-        data = NetworkMessage(app: "", title: "")
+        resetCaptureChain()
+        return
       } else {
+        data.incognito = frontWindow.mode == "normal" ? false : nil
         data.url = activeTab.URL
 
         // the tab title is more accurate and often different than the window title
@@ -480,7 +640,7 @@ class MainThing {
 
         if let tabTitle = activeTab.title {
           if(tabTitle != "" && data.title != tabTitle) {
-            error("tab title diff: \(tabTitle), window title: \(data.title)")
+            debug("Browser tab title differs from window title")
             data.title = tabTitle
           }
         }
@@ -510,18 +670,26 @@ class MainThing {
       // comment above applies here as well
       if let tabTitle = activeTab.name {
         if tabTitle != "" && data.title != tabTitle {
-          error("tab title diff: \(tabTitle), window title: \(data.title)")
+            debug("Browser tab title differs from window title")
           data.title = tabTitle
         }
       }
     }
 
+    if let consent = captureConsent {
+      guard let minimized = consent.filter(data, at: nowTime) else { resetCaptureChain(); return }
+      data = minimized
+    }
     if researchEnabled {
       data = applyResearchFilter(data)
     } else if excludeTitle || titleShouldBeExcluded(data.title ?? "") {
       data.title = "excluded"
     }
 
+    if let consent = captureConsent {
+      guard let minimized = consent.filter(data, at: nowTime) else { resetCaptureChain(); return }
+      data = minimized
+    }
     let heartbeat = Heartbeat(timestamp: nowTime, data: data)
     sendHeartbeat(heartbeat)
   }
