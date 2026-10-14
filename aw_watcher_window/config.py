@@ -1,21 +1,41 @@
 import argparse
 
+import tomlkit
+
 from aw_core.config import load_config_toml
 
+# Only end-user options belong here. load_config_toml() writes this template into
+# the user's config file on first run; it comments out keys but NOT table headers,
+# so anything listed here is authored into every fresh install's config.
 default_config = """
 [aw-watcher-window]
 exclude_title = false
 exclude_titles = []
 poll_time = 1.0
 strategy_macos = "swift"
-research_enabled = false
+""".strip()
 
-[aw-watcher-window.research_category_map]
+# Research Edition defaults, deliberately kept out of default_config: these are
+# study/dev knobs, not end-user options, and should not be persisted into the
+# config of users who are not part of a study. They are still read normally when
+# a user does set them (see load_config), which is how the Research Edition build
+# and study participants configure them.
+#
+# The Research Edition release build rewrites the flag below with
+#   sed -i 's/^research_enabled = false$/research_enabled = true/'
+# (ActivityWatch/activitywatch, .github/workflows/release.yml). Keep that line at
+# column 0 and byte-identical.
+research_defaults = """
+research_enabled = false
 """.strip()
 
 
 def load_config():
-    return load_config_toml("aw-watcher-window", default_config)["aw-watcher-window"]
+    config = load_config_toml("aw-watcher-window", default_config)["aw-watcher-window"]
+    # Research defaults fill in only what the user's config didn't set.
+    for key, value in tomlkit.parse(research_defaults).items():
+        config.setdefault(key, value)
+    return config
 
 
 def parse_args():
@@ -72,5 +92,12 @@ def parse_args():
         help="Disable Research Edition mode, even when enabled in the config file.",
     )
     parsed_args = parser.parse_args()
+    if isinstance(parsed_args.exclude_titles, str):
+        parsed_args.exclude_titles = [parsed_args.exclude_titles]
+    elif not isinstance(parsed_args.exclude_titles, list) or not all(
+        isinstance(title, str) for title in parsed_args.exclude_titles
+    ):
+        parser.error("exclude_titles must be a string or a list of strings")
     parsed_args.research_category_map = dict(config.get("research_category_map", {}))
+    parsed_args.research_app_category_map = dict(config.get("research_app_category_map", {}))
     return parsed_args

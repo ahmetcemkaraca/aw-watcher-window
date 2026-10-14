@@ -1,96 +1,49 @@
-name: Build
+name: Collector source checks
 
 on:
   push:
-    branches: [ master ]
   pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    name: test on ${{ matrix.os }} (py-${{ matrix.python_version }})
-    runs-on: ${{ matrix.os }}
+  source:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python_version: [3.9]
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'recursive'
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python_version }}
-    - name: Create virtualenv
-      shell: bash
-      run: |
-        python -m venv venv
-    - name: Install dependencies
-      shell: bash
-      run: |
-        # we need poetry==1.3.2
-        # due to: https://github.com/python-poetry/poetry/issues/7611 
-        # seen in: https://github.com/ActivityWatch/aw-watcher-window/actions/runs/5891369412/job/15978283144
-        pip install poetry==1.3.2  
-        source venv/bin/activate || source venv/Scripts/activate
-        if [ "${{ runner.os }}" = "macOS" ]; then
-          MACOSX_DEPLOYMENT_TARGET=12.0 make build
-        else
-          make build
-        fi
-    - name: Check macOS deployment target
-      if: runner.os == 'macOS'
-      shell: bash
-      run: |
-        otool -l aw_watcher_window/aw-watcher-window-macos | grep -A4 'LC_BUILD_VERSION' | grep 'minos 12.0'
-    - name: Run tests
-      shell: bash
-      run: |
-        source venv/bin/activate || source venv/Scripts/activate
-        make test
-    - name: Package
-      shell: bash
-      run: |
-        source venv/bin/activate || source venv/Scripts/activate
-        if [ "${{ runner.os }}" = "macOS" ]; then
-          MACOSX_DEPLOYMENT_TARGET=12.0 make package
-        else
-          make package
-        fi
-    - name: Test package
-      shell: bash
-      run: |
-          dist/aw-watcher-window/aw-watcher-window --help
-    - name: Upload package
-      uses: actions/upload-artifact@v4
-      with:
-        name: aw-watcher-window-${{ runner.os }}-py${{ matrix.python_version }}
-        path: dist/aw-watcher-window
-
-  typecheck:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: 'recursive'
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.9
-    - name: Create virtualenv
-      shell: bash
-      run: |
-        python -m venv venv
-    - name: Install dependencies
-      shell: bash
-      run: |
-        pip install poetry
-        source venv/bin/activate || source venv/Scripts/activate
-        make build
-    - name: Typecheck
-      shell: bash
-      run: |
-        source venv/bin/activate || source venv/Scripts/activate
-        make typecheck
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: aw-watcher-window
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ahmetcemkaraca/aw-client
+          ref: 4d9df4f81c49676a93a24d436842f3c97c57ebbd
+          path: aw-client
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.9'
+      - name: Install public source dependencies
+        # shortcut: runtime packages resolve from PyPI; freeze them before release builds.
+        run: python -m pip install ./aw-client ./aw-watcher-window pytest==8.4.2 mypy==1.18.2
+      - name: Check Python collector
+        working-directory: aw-watcher-window
+        run: |
+          python -m pytest -q
+          python -m mypy aw_watcher_window --ignore-missing-imports
+          aw-watcher-window --help
+      - name: Compile native macOS collector
+        if: runner.os == 'macOS'
+        working-directory: aw-watcher-window
+        run: make build-swift MACOSX_DEPLOYMENT_TARGET=12.0

@@ -16,6 +16,7 @@ aw_watcher_window/aw-watcher-window-macos: aw_watcher_window/macos.swift
 
 test:
 	poetry run aw-watcher-window --help  # Ensures that it at least starts
+	poetry run python -m pytest tests/
 	make typecheck
 
 typecheck:

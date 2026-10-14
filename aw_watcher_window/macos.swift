@@ -161,7 +161,7 @@ struct CaptureConsent: Decodable {
     }
     let app = input.app.lowercased()
     if excluded_apps.contains(where: { app.contains($0) }) { return nil }
-    let isBrowser = input.url != nil || ["chrome", "chromium", "firefox", "safari", "brave", "msedge", "microsoft edge", "opera"].contains(where: { app.contains($0) })
+    let isBrowser = input.url != nil || isResearchBrowser(input.app) || ["chrome", "chromium", "firefox", "safari", "brave", "msedge", "microsoft edge", "opera"].contains(where: { app.contains($0) })
     if isBrowser && (!browser || input.incognito != false) { return nil }
     if !isBrowser && !window { return nil }
     if input.incognito == true { return nil }
@@ -241,6 +241,32 @@ func error(_ msg: String) {
   fflush(stdout)
 }
 
+// AX attributes are CF types. `as? String` uses String's ObjC bridge, which
+// calls `-[obj length]` without a class check. A non-NSString then aborts the
+// helper — the #144 crash was `-[NSHTTPURLResponse length]`. Check CF type first.
+func axString(_ value: AnyObject?) -> String? {
+  guard let value = value else { return nil }
+  let cfValue = value as CFTypeRef
+  let typeID = CFGetTypeID(cfValue)
+  if typeID == CFStringGetTypeID() {
+    return (cfValue as! CFString) as String
+  }
+  if typeID == CFAttributedStringGetTypeID() {
+    return (value as! NSAttributedString).string
+  }
+  debug("Ignoring non-string AX value of type \(type(of: value))")
+  return nil
+}
+
+func axElement(_ value: AnyObject?) -> AXUIElement? {
+  guard let value = value else { return nil }
+  if CFGetTypeID(value as CFTypeRef) == AXUIElementGetTypeID() {
+    return (value as! AXUIElement)
+  }
+  debug("Ignoring non-AXUIElement value of type \(type(of: value))")
+  return nil
+}
+
 // Placeholder values, set in start() from CLI arguments
 var baseurl = "http://localhost:5600"
 // NOTE: this differs from the hostname we get from Python, here we get `.local`, but in Python we get `.localdomain`
@@ -251,6 +277,7 @@ var excludeTitle = false
 var excludeTitlePatterns: [NSRegularExpression] = []
 var researchEnabled = false
 var researchCategoryMap: [(pattern: String, category: String)] = []
+var researchAppCategoryMap: [(app: String, category: String)] = []
 
 let researchBrowserApps = Set([
   "chrome",
@@ -261,12 +288,21 @@ let researchBrowserApps = Set([
   "google-chrome-unstable",
   "chromium",
   "chromium-browser",
+  "chromium.exe",
   "brave browser",
   "brave",
   "brave-browser",
+  "arc",
+  "arc browser",
   "firefox",
   "firefox developer edition",
   "firefox-esr",
+  "firefox nightly",
+  "zen",
+  "zen browser",
+  "librewolf",
+  "waterfox",
+  "floorp",
   "safari",
   "edge",
   "microsoft edge",
@@ -274,6 +310,8 @@ let researchBrowserApps = Set([
   "microsoft-edge-beta",
   "microsoft-edge-dev",
   "opera",
+  "vivaldi",
+  "vivaldi.exe",
   "chrome.exe",
   "brave.exe",
   "firefox.exe",
@@ -282,31 +320,6 @@ let researchBrowserApps = Set([
 ])
 
 let main = MainThing()
-private var oldHeartbeat: Heartbeat?
-private var captureEpoch: UInt64 = 0
-private let heartbeatStateLock = NSLock()
-
-func heartbeatSnapshot() -> (Heartbeat?, UInt64) {
-  heartbeatStateLock.lock()
-  defer { heartbeatStateLock.unlock() }
-  return (oldHeartbeat, captureEpoch)
-}
-
-func resetCaptureChain() {
-  heartbeatStateLock.lock()
-  defer { heartbeatStateLock.unlock() }
-  oldHeartbeat = nil
-  captureEpoch &+= 1
-}
-
-func rememberHeartbeat(_ heartbeat: Heartbeat, epoch: UInt64) {
-  heartbeatStateLock.lock()
-  defer { heartbeatStateLock.unlock() }
-  guard epoch == captureEpoch, oldHeartbeat == nil || oldHeartbeat!.timestamp <= heartbeat.timestamp else { return }
-  var stored = heartbeat
-  stored.data.capture_break = nil
-  oldHeartbeat = stored
-}
 
 let encoder = JSONEncoder()
 let formatter = ISO8601DateFormatter()
@@ -370,6 +383,18 @@ func parseOptionalArguments(_ arguments: ArraySlice<String>) {
       continue
     }
 
+    if argument == "--research-app-category" {
+      let appIndex = arguments.index(after: index)
+      let categoryIndex = appIndex < arguments.endIndex ? arguments.index(after: appIndex) : arguments.endIndex
+      guard appIndex < arguments.endIndex, categoryIndex < arguments.endIndex else {
+        error("Missing app/category values for --research-app-category")
+        exit(1)
+      }
+      researchAppCategoryMap.append((app: arguments[appIndex], category: arguments[categoryIndex]))
+      index = arguments.index(after: categoryIndex)
+      continue
+    }
+
     error("Unknown command-line option")
     exit(1)
   }
@@ -386,21 +411,60 @@ func isResearchBrowser(_ app: String) -> Bool {
   return researchBrowserApps.contains(app.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
 }
 
+// Return the category of the *longest* pattern contained in `haystack`.
+// Longest-match beats map order because study maps routinely contain both a
+// generic and a specific form of the same host ("google.com" vs
+// "docs.google.com"); first-match-wins would file every Google Docs/Drive/
+// Calendar/Meet URL under the generic entry. Ties resolve to map order.
+// Twin of `_longest_match` in research_filter.py — keep the two in sync.
+func longestResearchMatch(_ haystack: String) -> String? {
+  var bestCategory: String?
+  var bestLength = -1
+  for item in researchCategoryMap {
+    if item.pattern.isEmpty { continue }
+    // Compare by Unicode scalar count, not Character count: Swift's `count`
+    // measures grapheme clusters while Python's `len()` measures code points,
+    // which would let the two twins pick different winners for non-ASCII
+    // patterns of equal visual length.
+    let patternLength = item.pattern.unicodeScalars.count
+    if haystack.range(of: item.pattern, options: [.caseInsensitive]) != nil,
+      patternLength > bestLength
+    {
+      bestCategory = item.category
+      bestLength = patternLength
+    }
+  }
+  return bestCategory
+}
+
 func classifyResearch(_ title: String, url: String?) -> String {
   // Try URL first — more reliable than page title, which can change mid-load
   if let url = url, !url.isEmpty {
-    for item in researchCategoryMap {
-      if url.range(of: item.pattern, options: [.caseInsensitive]) != nil {
-        return item.category
-      }
+    if let category = longestResearchMatch(url) {
+      return category
     }
   }
-  for item in researchCategoryMap {
-    if title.range(of: item.pattern, options: [.caseInsensitive]) != nil {
+  if let category = longestResearchMatch(title) {
+    return category
+  }
+  return "excluded"
+}
+
+func classifyApp(_ app: String) -> String {
+  // Case-insensitive exact lookup of app name in the app category map.
+  // Returns the mapped category, or "Excluded" when the app is not in the map.
+  // Both sides are trimmed and lowercased so a configured key carrying stray
+  // whitespace matches identically here and in the Python path
+  // (research_filter.classify_app). Without trimming the configured key, a map
+  // entry like " Microsoft Outlook" would classify on Linux/Windows but fall
+  // through to "Excluded" on the macOS Swift path for the same config.
+  let appLower = app.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+  for item in researchAppCategoryMap {
+    if item.app.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == appLower {
       return item.category
     }
   }
-  return "excluded"
+  return "Excluded"
 }
 
 func applyResearchFilter(_ data: NetworkMessage) -> NetworkMessage {
@@ -412,7 +476,14 @@ func applyResearchFilter(_ data: NetworkMessage) -> NetworkMessage {
     return NetworkMessage(app: data.app, title: classifyResearch(data.title ?? "", url: data.url), url: nil)
   }
 
-  return NetworkMessage(app: data.app, title: nil, url: nil)
+  // Non-browser: map app to study category when a map is provided;
+  // otherwise keep app name and drop title (legacy behaviour).
+  if researchAppCategoryMap.isEmpty {
+    return NetworkMessage(app: data.app, title: nil, url: nil)
+  }
+  // Replace the raw app identity with its category — the app name is the
+  // sensitive identifier for non-browser apps, so it must not be retained.
+  return NetworkMessage(app: classifyApp(data.app), title: nil, url: nil)
 }
 
 func start() {
@@ -425,7 +496,7 @@ func start() {
 
   // Check that we get the 4 required arguments plus any optional flags
   if arguments.count < 5 {
-    print("Usage: aw-watcher-window <url> <bucket> <hostname> <client> [--exclude-title] [--exclude-titles <pattern> ...] [--research] [--research-category <pattern> <category> ...]")
+    print("Usage: aw-watcher-window <url> <bucket> <hostname> <client> [--exclude-title] [--exclude-titles <pattern> ...] [--research] [--research-category <pattern> <category> ...] [--research-app-category <app_name> <category> ...]")
     exit(1)
   }
 
@@ -442,7 +513,8 @@ func start() {
     return
   }
 
-  createBucket()
+  // The bucket is created by the heartbeat sender before its first send, and
+  // retried with the heartbeats if the server is not up yet.
 
   // listen for changes in focused application
   NSWorkspace.shared.notificationCenter.addObserver(
@@ -459,76 +531,192 @@ func start() {
 }
 
 // TODO might be better to have the python wrapper create this before launching the swift application
-func createBucket() {
+func createBucket() async throws {
   let payload = try! encoder.encode(
     Bucket(client: clientName, type: "currentwindow", hostname: clientHostname))
 
   let url = URL(string: "\(baseurl)/api/0/buckets/\(bucketName)")!
-  Task {
-    var urlRequest = URLRequest(url: url)
-    urlRequest.httpMethod = "POST"
-    urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
-    let response = try await captureHTTP.upload(urlRequest, payload: payload)
-    guard (200...299).contains(response.statusCode) else {
-      log("Failed to create bucket")
-      return
-    }
+  var urlRequest = URLRequest(url: url)
+  urlRequest.httpMethod = "POST"
+  urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
+  let response = try await captureHTTP.upload(urlRequest, payload: payload)
+  let status = response.statusCode
+  // 304: the bucket already exists
+  guard (200...299).contains(status) || status == 304 else {
+    throw HeartbeatError.error(msg: "Local bucket creation was rejected")
   }
 }
 
-func sendHeartbeat(_ incoming: Heartbeat) {
-  let (previous, epoch) = heartbeatSnapshot()
-  var heartbeat = incoming
-  if captureConsent != nil && previous == nil { heartbeat.data.capture_break = true }
-  let oldPayloadDifferent = previous != nil && previous!.data != heartbeat.data
-  let timeSinceLastHeartbeat = previous != nil ? heartbeat.timestamp.timeIntervalSince(previous!.timestamp) : -1.0
+/// Delivers heartbeats one at a time, in order, and keeps them when the
+/// server is slow or not up yet (ActivityWatch/aw-watcher-window#160).
+///
+/// Before this, every poll and focus change spawned its own Task: when the
+/// server stalled they piled up in parallel (six in flight were observed) and
+/// a failed heartbeat was dropped, so the time until the next successful
+/// send was credited to whatever window happened to be sent next. Now a
+/// failed heartbeat is retried with backoff before anything newer is sent;
+/// pulsetimes are computed at send time, relative to the last heartbeat the
+/// server accepted, so the server-side merge still covers the gap.
+/// Heartbeats collected while the server is unreachable (e.g. the watcher
+/// starting before the server at login) are delivered when it comes back,
+/// in order.
+///
+/// `enqueue` is synchronous and takes a lock, so the order of calls (all on
+/// the main thread: poll timer and focus notifications) is the order of
+/// delivery; an actor reached through detached Tasks would not guarantee
+/// that. A single drain Task consumes the queue.
+final class HeartbeatSender: @unchecked Sendable {
+  /// Oldest pending heartbeats are dropped past this; ~28 h at one per 10 s.
+  static let maxQueued = 10_000
+  static let maxRetryDelay: TimeInterval = 60
 
-  // if you resize a window a ton of events (subsecond) will be fired
-  // we enforce a 1s minimum gap between events to avoid this
-  if timeSinceLastHeartbeat != -1.0 && timeSinceLastHeartbeat <= 0.5 {
-    debug("skipping heartbeat, last heartbeat was sent 1s ago")
-    return
-  }
+  private let lock = NSLock()
+  // Guarded by `lock`:
+  private var queue: [(heartbeat: Heartbeat, epoch: UInt64)] = []
+  private var captureEpoch: UInt64 = 0
+  /// Taken from the queue and retried until the server accepts it. Kept
+  /// apart from `queue` so dropping the oldest pending entry never touches
+  /// the one being sent.
+  private var inFlight: (heartbeat: Heartbeat, epoch: UInt64)?
+  private var draining = false
+  private var lastEnqueued: Heartbeat?
+  private var dropped = 0
+  // Only touched by the single drain task:
+  private var lastSent: Heartbeat?
+  private var lastSentEpoch: UInt64?
+  private var bucketReady = false
+  private var retryDelay: TimeInterval = 1
 
-  // TODO running these async could cause weird state issues since the observer stuff can send a log of heartbeats
-  //      in a short time under certain circumstances, and we don't want to send them all
-  Task {
-    guard heartbeatSnapshot().1 == epoch else { return }
-    if oldPayloadDifferent {
-      debug("sending old heartbeat for merging")
+  func enqueue(_ heartbeat: Heartbeat) {
+    lock.lock()
+    defer { lock.unlock() }
 
-      do {
-        // unlike the python aw-client library, we do not enforce a `commit_interval` and instead send the old event (which is not invalid)
-        // at the current time with a pulse value equal to the time since this event was originally sent. The aw-server will then merge
-        // this new event with the original event, extending the recorded time spent on this particular window/application.
-
-        let refreshedOldHeartbeat = Heartbeat(
-          // it is important to refresh the hearbeat using the timestamp where the user stopped working on the previous application
-          // more info: https://github.com/ActivityWatch/aw-watcher-window/pull/69
-          // we don't *think* this millisecond subtraction is necessary, but it may be:
-          // https://github.com/ActivityWatch/aw-watcher-window/pull/69#discussion_r987064282
-          timestamp: heartbeat.timestamp - 0.001,
-          data: previous!.data
-        )
-
-        try await sendHeartbeatSingle(refreshedOldHeartbeat, pulsetime: timeSinceLastHeartbeat + 1)
-      } catch {
-        log("Failed to send old heartbeat: \(error)")
-        return
-      }
-    }
-
-    guard heartbeatSnapshot().1 == epoch else { return }
-    do {
-      let since_last_seconds = previous != nil ? heartbeat.timestamp.timeIntervalSince(previous!.timestamp) : 0
-      try await sendHeartbeatSingle(heartbeat, pulsetime: since_last_seconds + 1)
-    } catch {
-      log("Failed to send heartbeat: \(error)")
+    // if you resize a window a ton of events (subsecond) will be fired
+    // we enforce a 1s minimum gap between events to avoid this
+    if let last = lastEnqueued, heartbeat.timestamp.timeIntervalSince(last.timestamp) <= 0.5 {
+      debug("skipping heartbeat, last heartbeat was sent 1s ago")
       return
     }
+    lastEnqueued = heartbeat
 
-    rememberHeartbeat(heartbeat, epoch: epoch)
+    if queue.count >= Self.maxQueued {
+      queue.removeFirst()
+      dropped += 1
+    }
+    queue.append((heartbeat, captureEpoch))
+
+    if !draining {
+      draining = true
+      Task { await self.drain() }
+    }
   }
+
+  func resetCaptureChain() {
+    lock.lock()
+    defer { lock.unlock() }
+    queue.removeAll()
+    inFlight = nil
+    lastEnqueued = nil
+    captureEpoch &+= 1
+  }
+
+  private func isCurrent(_ epoch: UInt64) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return epoch == captureEpoch
+  }
+
+  /// The heartbeat to send next: the one still in flight, else the oldest
+  /// pending one. Ends the drain (under the lock, so no enqueue is missed)
+  /// when there is nothing left.
+  private func next() -> (heartbeat: Heartbeat, epoch: UInt64)? {
+    lock.lock()
+    defer { lock.unlock() }
+    if inFlight == nil && !queue.isEmpty {
+      inFlight = queue.removeFirst()
+    }
+    if inFlight == nil {
+      draining = false
+    }
+    return inFlight
+  }
+
+  private func accepted(_ epoch: UInt64) {
+    lock.lock()
+    if inFlight?.epoch == epoch { inFlight = nil }
+    lock.unlock()
+  }
+
+  private func pendingCount() -> (queued: Int, dropped: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    let d = dropped
+    dropped = 0
+    return (queue.count + (inFlight == nil ? 0 : 1), d)
+  }
+
+  private func drain() async {
+    while let pending = next() {
+      do {
+        if !bucketReady {
+          try await createBucket()
+          bucketReady = true
+        }
+        try await send(pending.heartbeat, epoch: pending.epoch)
+        accepted(pending.epoch)
+        retryDelay = 1
+      } catch {
+        if !isCurrent(pending.epoch) { continue }
+        let (queued, dropped) = pendingCount()
+        if dropped > 0 {
+          log("Dropped \(dropped) oldest queued heartbeats (queue limit \(Self.maxQueued))")
+        }
+        log("Failed to send heartbeat (\(queued) queued), retrying in \(Int(retryDelay))s: \(error.localizedDescription)")
+        try? await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+        retryDelay = min(retryDelay * 2, Self.maxRetryDelay)
+      }
+    }
+  }
+
+  private func send(_ incoming: Heartbeat, epoch: UInt64) async throws {
+    guard isCurrent(epoch) else { return }
+    let previous = lastSentEpoch == epoch ? lastSent : nil
+    var heartbeat = incoming
+    if captureConsent != nil && previous == nil { heartbeat.data.capture_break = true }
+    if let last = previous, last.data != incoming.data {
+      debug("sending old heartbeat for merging")
+      // unlike the python aw-client library, we do not enforce a `commit_interval` and instead send the old event (which is not invalid)
+      // at the current time with a pulse value equal to the time since this event was originally sent. The aw-server will then merge
+      // this new event with the original event, extending the recorded time spent on this particular window/application.
+      let refreshedOldHeartbeat = Heartbeat(
+        // it is important to refresh the hearbeat using the timestamp where the user stopped working on the previous application
+        // more info: https://github.com/ActivityWatch/aw-watcher-window/pull/69
+        // we don't *think* this millisecond subtraction is necessary, but it may be:
+        // https://github.com/ActivityWatch/aw-watcher-window/pull/69#discussion_r987064282
+        timestamp: heartbeat.timestamp - 0.001,
+        data: last.data
+      )
+      try await sendHeartbeatSingle(refreshedOldHeartbeat, pulsetime: heartbeat.timestamp.timeIntervalSince(last.timestamp) + 1)
+    }
+
+    guard isCurrent(epoch) else { return }
+    let sinceLast = previous != nil ? heartbeat.timestamp.timeIntervalSince(previous!.timestamp) : 0
+    try await sendHeartbeatSingle(heartbeat, pulsetime: sinceLast + 1)
+    guard isCurrent(epoch) else { return }
+    heartbeat.data.capture_break = nil
+    lastSent = heartbeat
+    lastSentEpoch = epoch
+  }
+}
+
+let heartbeatSender = HeartbeatSender()
+
+func resetCaptureChain() {
+  heartbeatSender.resetCaptureChain()
+}
+
+func sendHeartbeat(_ heartbeat: Heartbeat) {
+  heartbeatSender.enqueue(heartbeat)
 }
 
 func sendHeartbeatSingle(_ heartbeat: Heartbeat, pulsetime: Double) async throws {
@@ -550,6 +738,7 @@ func sendHeartbeatSingle(_ heartbeat: Heartbeat, pulsetime: Double) async throws
 
 class MainThing {
   var observer: AXObserver?
+  var observedApp: AXUIElement?
   var oldWindow: AXUIElement?
   var pollingTimer: Timer?
 
@@ -561,8 +750,66 @@ class MainThing {
     "Brave Browser",
   ]
 
+  // Gecko-based browsers have no scripting interface for tabs, but expose the
+  // current page URL on their accessibility tree's AXWebArea node
+  let FIREFOX_BROWSERS = [
+    "Firefox",
+    "Firefox Developer Edition",
+    "Firefox Nightly",
+    "Zen",
+    "Zen Browser",
+    "LibreWolf",
+    "Waterfox",
+    "Floorp",
+  ]
+
+  // upper bound on accessibility elements examined per lookup, so a
+  // pathological tree can't stall the watcher (the web area is typically
+  // found within a few dozen elements)
+  let AX_TRAVERSAL_LIMIT = 384
+
+  // Search the window's accessibility tree breadth-first for an AXWebArea node
+  // and return its AXURL, the URL of the loaded page. The top-level document's
+  // web area sits shallow in Gecko's tree and is reached before any web areas
+  // of nested iframes, so the first hit is the current page.
+  // (there is no kAXWebAreaRole constant in HIServices; the role string is
+  // defined by the browsers themselves)
+  func geckoURL(window: AXUIElement) -> String? {
+    var queue: [AXUIElement] = [window]
+    var index = 0
+    while index < queue.count && index < AX_TRAVERSAL_LIMIT {
+      let element = queue[index]
+      index += 1
+
+      var roleRef: AnyObject?
+      AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+      if axString(roleRef) == "AXWebArea" {
+        var urlRef: AnyObject?
+        AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &urlRef)
+        if let url = urlRef as? NSURL {
+          return url.absoluteString
+        }
+        // no URL on the web area (e.g. page still loading); stop rather than
+        // keep searching, since a deeper hit would be an iframe's web area
+        return axString(urlRef)
+      }
+
+      var childrenRef: AnyObject?
+      AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef)
+      if let children = childrenRef as? [AXUIElement] {
+        queue.append(contentsOf: children)
+      }
+    }
+    return nil
+  }
+
   @objc func pollActiveWindow() {
     debug("Polling active window")
+
+    guard let observer = observer else {
+      debug("Polling skipped: no accessibility observer")
+      return
+    }
 
     guard let frontmost = NSWorkspace.shared.frontmostApplication else {
       log("Failed to get frontmost application from polling")
@@ -575,13 +822,14 @@ class MainThing {
     var focusedWindow: AnyObject?
     AXUIElementCopyAttributeValue(focusedApp, kAXFocusedWindowAttribute as CFString, &focusedWindow)
 
-    if focusedWindow != nil {
-      focusedWindowChanged(observer!, window: focusedWindow as! AXUIElement)
+    if let focusedWindow = axElement(focusedWindow) {
+      focusedWindowChanged(observer, window: focusedWindow)
     }
   }
 
   deinit {
     pollingTimer?.invalidate()
+    tearDownObserver()
   }
 
   func windowTitleChanged(
@@ -601,21 +849,30 @@ class MainThing {
     AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &windowTitle)
 
     let applicationName = frontmost.localizedName ?? frontmost.bundleIdentifier ?? ""
-    var data = NetworkMessage(app: applicationName, title: windowTitle as? String ?? "")
+    var data = NetworkMessage(app: applicationName, title: axString(windowTitle) ?? "")
 
     if let consent = captureConsent,
-       (CHROME_BROWSERS.contains(applicationName) || applicationName == "Safari") && !consent.browser {
+       (CHROME_BROWSERS.contains(applicationName) || FIREFOX_BROWSERS.contains(applicationName) || applicationName == "Safari") && !consent.browser {
       resetCaptureChain()
       return
     }
     if CHROME_BROWSERS.contains(applicationName) {
       debug("Chrome browser detected, extracting URL and title")
 
-      guard let bundleIdentifier = frontmost.bundleIdentifier else {
+      guard frontmost.bundleIdentifier != nil else {
         log("Failed to get bundle identifier from frontmost application, which was recognized to be Chrome")
         return
       }
-      let chromeObject: ChromeProtocol = SBApplication.init(bundleIdentifier: bundleIdentifier)!
+      // Address the running process by PID and bail if it already quit: a
+      // bundle-identifier target makes ScriptingBridge relaunch a browser that just quit.
+      guard !frontmost.isTerminated else {
+        log("Chrome is no longer running, skipping scripting request")
+        return
+      }
+      guard let chromeObject = SBApplication.init(processIdentifier: frontmost.processIdentifier) as? ChromeProtocol else {
+        log("Failed to create ScriptingBridge proxy for Chrome")
+        return
+      }
 
       guard let windows = chromeObject.windows,
             let frontWindow = windows().first else {
@@ -648,11 +905,20 @@ class MainThing {
     } else if frontmost.localizedName == "Safari" {
       debug("Safari browser detected, extracting URL and title")
 
-      guard let bundleIdentifier = frontmost.bundleIdentifier else {
+      guard frontmost.bundleIdentifier != nil else {
         log("Failed to get bundle identifier from frontmost application, which was recognized to be Safari")
         return
       }
-      let safariObject: SafariApplication = SBApplication.init(bundleIdentifier: bundleIdentifier)!
+      // Address the running process by PID and bail if it already quit: a
+      // bundle-identifier target makes ScriptingBridge relaunch a browser that just quit.
+      guard !frontmost.isTerminated else {
+        log("Safari is no longer running, skipping scripting request")
+        return
+      }
+      guard let safariObject = SBApplication.init(processIdentifier: frontmost.processIdentifier) as? SafariApplication else {
+        log("Failed to create ScriptingBridge proxy for Safari")
+        return
+      }
 
       guard let windows = safariObject.windows,
             let frontWindow = windows().first else {
@@ -670,9 +936,27 @@ class MainThing {
       // comment above applies here as well
       if let tabTitle = activeTab.name {
         if tabTitle != "" && data.title != tabTitle {
-            debug("Browser tab title differs from window title")
+          debug("Browser tab title differs from window title")
           data.title = tabTitle
         }
+      }
+    } else if FIREFOX_BROWSERS.contains(applicationName) {
+      debug("Firefox-based browser detected, extracting URL from accessibility tree")
+
+      // note: private windows are not hidden here (unlike the Chrome incognito
+      // branch) — Gecko does not mark them in the accessibility tree, and their
+      // window titles carry a "Private Browsing" suffix for rules to match
+      data.url = geckoURL(window: axElement)
+
+      if data.url == nil {
+        // Newer Gecko builds instantiate their accessibility engine lazily and
+        // no longer treat plain tree walks as an assistive client, leaving the
+        // window's AX tree without any web content. Requesting
+        // AXEnhancedUserInterface (as VoiceOver does) turns the engine on; the
+        // call may report an error while the engine spins up, but the tree is
+        // populated for subsequent polls and stays on for the browser session.
+        let axApp = AXUIElementCreateApplication(frontmost.processIdentifier)
+        AXUIElementSetAttributeValue(axApp, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
       }
     }
 
@@ -684,6 +968,9 @@ class MainThing {
       data = applyResearchFilter(data)
     } else if excludeTitle || titleShouldBeExcluded(data.title ?? "") {
       data.title = "excluded"
+      // the URL identifies the page at least as precisely as the title does,
+      // so an excluded window must not report it either
+      data.url = nil
     }
 
     if let consent = captureConsent {
@@ -694,11 +981,35 @@ class MainThing {
     sendHeartbeat(heartbeat)
   }
 
+  func tearDownObserver() {
+    // Unregister notifications before dropping the observer. Removing only the
+    // run-loop source leaves the Mach receive port alive; AX events then queue
+    // up to qlimit (1024) and leak wired memory (#139). AXObserverCreate also
+    // overwrites the out-pointer without CFRelease, so the previous observer
+    // must be niled first.
+    if let previous = observer {
+      if let window = oldWindow {
+        AXObserverRemoveNotification(previous, window, kAXTitleChangedNotification as CFString)
+      }
+      if let app = observedApp {
+        AXObserverRemoveNotification(previous, app, kAXFocusedWindowChangedNotification as CFString)
+      }
+      CFRunLoopRemoveSource(
+        RunLoop.current.getCFRunLoop(),
+        AXObserverGetRunLoopSource(previous),
+        CFRunLoopMode.defaultMode
+      )
+    }
+    oldWindow = nil
+    observedApp = nil
+    observer = nil
+  }
+
   @objc func focusedWindowChanged(_ observer: AXObserver, window: AXUIElement) {
     debug("Focused window changed")
 
-    if oldWindow != nil {
-      AXObserverRemoveNotification(observer, oldWindow!, kAXFocusedWindowChangedNotification as CFString)
+    if let oldWindow = oldWindow {
+      AXObserverRemoveNotification(observer, oldWindow, kAXTitleChangedNotification as CFString)
     }
 
     let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
@@ -712,14 +1023,7 @@ class MainThing {
 
   @objc func focusedAppChanged() {
     debug("Focused app changed")
-
-    if observer != nil {
-      CFRunLoopRemoveSource(
-        RunLoop.current.getCFRunLoop(),
-        AXObserverGetRunLoopSource(observer!),
-        CFRunLoopMode.defaultMode
-      )
-    }
+    tearDownObserver()
 
     guard let frontmost = NSWorkspace.shared.frontmostApplication else {
       log("Failed to get frontmost application from app change notification")
@@ -729,6 +1033,7 @@ class MainThing {
     let pid = frontmost.processIdentifier
     let focusedApp = AXUIElementCreateApplication(pid)
 
+    var newObserver: AXObserver?
     AXObserverCreate(
       pid,
       {
@@ -752,22 +1057,31 @@ class MainThing {
             notification: notification
           )
         }
-      }, &observer)
+      }, &newObserver)
+
+    guard let newObserver = newObserver else {
+      log("Failed to create accessibility observer")
+      return
+    }
+
+    observer = newObserver
+    observedApp = focusedApp
 
     let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-    AXObserverAddNotification(observer!, focusedApp, kAXFocusedWindowChangedNotification as CFString, selfPtr)
+    AXObserverAddNotification(
+      newObserver, focusedApp, kAXFocusedWindowChangedNotification as CFString, selfPtr)
 
     CFRunLoopAddSource(
       RunLoop.current.getCFRunLoop(),
-      AXObserverGetRunLoopSource(observer!),
+      AXObserverGetRunLoopSource(newObserver),
       CFRunLoopMode.defaultMode
     )
 
     var focusedWindow: AnyObject?
     AXUIElementCopyAttributeValue(focusedApp, kAXFocusedWindowAttribute as CFString, &focusedWindow)
 
-    if focusedWindow != nil {
-      focusedWindowChanged(observer!, window: focusedWindow as! AXUIElement)
+    if let focusedWindow = axElement(focusedWindow) {
+      focusedWindowChanged(newObserver, window: focusedWindow)
     }
   }
 }

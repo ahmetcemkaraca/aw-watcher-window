@@ -1,9 +1,12 @@
 """Tests for aw-watcher-window Research Edition filter."""
 
+import re
 import unittest
+from pathlib import Path
 
 from aw_watcher_window.research_filter import (
     BROWSER_APPS,
+    classify_app,
     classify_title,
     is_browser,
     transform,
@@ -40,6 +43,29 @@ class TestIsBrowser(unittest.TestCase):
         for app in ("Slack", "Terminal", "iTerm2", "Code", "zoom.us", ""):
             self.assertFalse(is_browser(app), f"{app!r} should not be a browser")
 
+    def test_python_and_swift_browser_aliases_match(self):
+        swift = (Path(__file__).parents[1] / "aw_watcher_window" / "macos.swift").read_text()
+        match = re.search(
+            r"let\s+researchBrowserApps\s*=\s*Set\s*\(\s*\[(?P<entries>.*?)\]\s*\)",
+            swift,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        swift_browser_apps = set(re.findall(r'"([^"]+)"', match.group("entries")))
+        self.assertEqual(swift_browser_apps, BROWSER_APPS)
+
+    def test_url_capturing_macos_browsers_are_research_browsers(self):
+        # The macOS helper extracts URLs for these apps; if the research filter
+        # does not treat them as browsers, their pages are never classified.
+        swift = (Path(__file__).parents[1] / "aw_watcher_window" / "macos.swift").read_text()
+        for name in ("CHROME_BROWSERS", "FIREFOX_BROWSERS"):
+            match = re.search(
+                rf"let\s+{name}\s*=\s*\[(?P<entries>.*?)\]", swift, re.DOTALL
+            )
+            self.assertIsNotNone(match, name)
+            for app in re.findall(r'"([^"]+)"', match.group("entries")):
+                self.assertTrue(is_browser(app), f"{name} entry {app!r}")
+
 
 class TestClassifyTitle(unittest.TestCase):
     CATEGORY_MAP = {
@@ -75,10 +101,15 @@ class TestClassifyTitle(unittest.TestCase):
             "excluded",
         )
 
-    def test_first_match_wins(self):
-        # Both "facebook" and "twitter" present — first pattern in iteration wins
+    def test_longest_pattern_wins(self):
+        # Both "facebook" (8) and "twitter" (7) present — the longer pattern wins
         result = classify_title("Facebook Twitter integration - Chrome", self.CATEGORY_MAP)
         self.assertEqual(result, "Facebook")
+
+    def test_equal_length_patterns_resolve_to_map_order(self):
+        # "gmail" and "inbox" are both 5 chars — the earlier map entry wins
+        category_map = {"gmail": "Email", "inbox": "Other"}
+        self.assertEqual(classify_title("gmail inbox", category_map), "Email")
 
     def test_empty_title(self):
         self.assertEqual(classify_title("", self.CATEGORY_MAP), "excluded")
@@ -185,6 +216,17 @@ class TestTransform(unittest.TestCase):
                 self.assertEqual(result["app"], app)
                 self.assertEqual(result["title"], "Youtube")
 
+    def test_original_classifier_browser_aliases_are_classified(self):
+        for app in ("Arc", "Arc Browser", "Vivaldi", "Vivaldi.exe", "Chromium.exe"):
+            with self.subTest(app=app):
+                window = {
+                    "app": app,
+                    "title": "New Tab",
+                    "url": "https://youtube.com/watch?v=private",
+                }
+                result = transform(window, self.CATEGORY_MAP)
+                self.assertEqual(result, {"app": app, "title": "Youtube"})
+
     def test_input_not_mutated(self):
         window = {"app": "Chrome", "title": "YouTube - Chrome"}
         original = dict(window)
@@ -212,6 +254,181 @@ class TestTransform(unittest.TestCase):
         result = transform(window, self.CATEGORY_MAP)
         self.assertEqual(result["title"], "Youtube")
         self.assertNotIn("url", result)
+
+
+class TestClassifyApp(unittest.TestCase):
+    APP_CATEGORY_MAP = {
+        "microsoft outlook": "Email",
+        "outlook.exe": "Email",
+        "microsoft teams": "Work & Productivity",
+        "teams": "Work & Productivity",
+        "spotify": "Music & Audio",
+        "finder": "Excluded",
+        "steam": "Games",
+    }
+
+    def test_exact_match(self):
+        self.assertEqual(classify_app("Microsoft Outlook", self.APP_CATEGORY_MAP), "Email")
+
+    def test_case_insensitive(self):
+        self.assertEqual(classify_app("SPOTIFY", self.APP_CATEGORY_MAP), "Music & Audio")
+        self.assertEqual(classify_app("spotify", self.APP_CATEGORY_MAP), "Music & Audio")
+        self.assertEqual(classify_app("Spotify", self.APP_CATEGORY_MAP), "Music & Audio")
+
+    def test_exe_suffix(self):
+        self.assertEqual(classify_app("outlook.exe", self.APP_CATEGORY_MAP), "Email")
+
+    def test_unmapped_returns_excluded(self):
+        self.assertEqual(classify_app("iTerm2", self.APP_CATEGORY_MAP), "Excluded")
+        self.assertEqual(classify_app("Terminal", self.APP_CATEGORY_MAP), "Excluded")
+        self.assertEqual(classify_app("", self.APP_CATEGORY_MAP), "Excluded")
+
+    def test_leading_trailing_spaces(self):
+        self.assertEqual(classify_app("  Spotify  ", self.APP_CATEGORY_MAP), "Music & Audio")
+
+    def test_explicit_excluded_entry(self):
+        # "Finder" is explicitly mapped to "Excluded" in Matthias's map
+        self.assertEqual(classify_app("Finder", self.APP_CATEGORY_MAP), "Excluded")
+
+    def test_empty_map_returns_excluded(self):
+        self.assertEqual(classify_app("Spotify", {}), "Excluded")
+
+    def test_mixed_case_map_keys(self):
+        # Configured keys may be mixed-case (as typed in config TOML); lookup
+        # must still match case-insensitively on both sides.
+        mixed_case_map = {
+            "Microsoft Outlook": "Email",
+            "Spotify": "Music & Audio",
+        }
+        self.assertEqual(classify_app("microsoft outlook", mixed_case_map), "Email")
+        self.assertEqual(classify_app("SPOTIFY", mixed_case_map), "Music & Audio")
+
+
+class TestTransformWithAppMap(unittest.TestCase):
+    CATEGORY_MAP = {
+        "youtube": "Video Streaming",
+        "facebook": "Social Networking",
+    }
+    APP_CATEGORY_MAP = {
+        "microsoft outlook": "Email",
+        "microsoft teams": "Work & Productivity",
+        "spotify": "Music & Audio",
+        "finder": "Excluded",
+    }
+
+    def test_non_browser_mapped_to_category(self):
+        # Raw app identity is REPLACED by its category; title is dropped.
+        window = {"app": "Microsoft Outlook", "title": "Inbox — johndoe@example.com"}
+        result = transform(window, self.CATEGORY_MAP, self.APP_CATEGORY_MAP)
+        self.assertEqual(result["app"], "Email")
+        self.assertNotIn("title", result)
+
+    def test_non_browser_unmapped_returns_excluded(self):
+        # Unmapped non-browser app is anonymized to "Excluded", title dropped.
+        window = {"app": "iTerm2", "title": "~/projects/secret"}
+        result = transform(window, self.CATEGORY_MAP, self.APP_CATEGORY_MAP)
+        self.assertEqual(result["app"], "Excluded")
+        self.assertNotIn("title", result)
+
+    def test_non_browser_title_and_url_stripped(self):
+        # App replaced by category; sensitive title AND URL must not leak
+        window = {
+            "app": "Microsoft Outlook",
+            "title": "Private inbox",
+            "url": "mailbox://private@corp.example.com/INBOX",
+        }
+        result = transform(window, self.CATEGORY_MAP, self.APP_CATEGORY_MAP)
+        self.assertEqual(result["app"], "Email")
+        self.assertNotIn("title", result)
+        self.assertNotIn("url", result)
+
+    def test_non_browser_incognito_preserved(self):
+        window = {"app": "Spotify", "title": "Now playing: Secret Playlist", "incognito": True}
+        result = transform(window, self.CATEGORY_MAP, self.APP_CATEGORY_MAP)
+        self.assertEqual(result["app"], "Music & Audio")
+        self.assertEqual(result["incognito"], True)
+
+    def test_browser_unaffected_by_app_map(self):
+        # Browser classification should not change even when an app map is present
+        window = {"app": "Chrome", "title": "YouTube - Chrome"}
+        result = transform(window, self.CATEGORY_MAP, self.APP_CATEGORY_MAP)
+        self.assertEqual(result["title"], "Video Streaming")
+
+    def test_no_app_map_legacy_behaviour(self):
+        # Without app map, non-browser keeps raw app name and drops title (backward compat)
+        window = {"app": "Microsoft Outlook", "title": "Inbox"}
+        result = transform(window, self.CATEGORY_MAP, None)
+        self.assertEqual(result["app"], "Microsoft Outlook")
+        self.assertNotIn("title", result)
+
+    def test_empty_app_map_falls_back_to_legacy(self):
+        # An empty app map is treated as "not provided": research_enabled with no
+        # configured app map must NOT classify every non-browser app as "Excluded".
+        window = {"app": "Microsoft Outlook", "title": "Inbox"}
+        result = transform(window, self.CATEGORY_MAP, {})
+        self.assertEqual(result["app"], "Microsoft Outlook")
+        self.assertNotIn("title", result)
+
+    def test_explicit_excluded_mapped_app(self):
+        # "Finder" → "Excluded" (explicit map entry, not a lookup miss)
+        window = {"app": "Finder", "title": "/Users/jdoe/Documents"}
+        result = transform(window, self.CATEGORY_MAP, self.APP_CATEGORY_MAP)
+        self.assertEqual(result["app"], "Excluded")
+        self.assertNotIn("title", result)
+
+    def test_input_not_mutated_with_app_map(self):
+        window = {"app": "Spotify", "title": "Now playing"}
+        original = dict(window)
+        transform(window, self.CATEGORY_MAP, self.APP_CATEGORY_MAP)
+        self.assertEqual(window, original)
+
+class TestSpecificHostBeatsGenericHost(unittest.TestCase):
+    """Regression: a generic host must not shadow a more specific one.
+
+    Study maps list ``google.com`` well before ``docs.google.com``. Under
+    first-match-wins every Google Workspace URL was filed as *Search &
+    Navigation* instead of *Work & Productivity* — reported from the
+    Research Edition b4 field test.
+    """
+
+    CATEGORY_MAP = {
+        "google.com": "Search & Navigation",
+        "docs.google.com": "Work & Productivity",
+        "drive.google.com": "Work & Productivity",
+        "calendar.google.com": "Work & Productivity",
+        "meet.google.com": "Work & Productivity",
+    }
+
+    def test_workspace_urls_are_work_not_search(self):
+        for url in (
+            "https://docs.google.com/document/d/abc/edit",
+            "https://drive.google.com/drive/my-drive",
+            "https://calendar.google.com/calendar/u/0/r",
+            "https://meet.google.com/xyz-abcd-efg",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    classify_title("", self.CATEGORY_MAP, url=url),
+                    "Work & Productivity",
+                )
+
+    def test_plain_google_search_still_matches_generic(self):
+        self.assertEqual(
+            classify_title("", self.CATEGORY_MAP, url="https://www.google.com/search?q=aw"),
+            "Search & Navigation",
+        )
+
+    def test_specific_host_also_wins_on_title_fallback(self):
+        self.assertEqual(
+            classify_title("docs.google.com - Untitled", self.CATEGORY_MAP),
+            "Work & Productivity",
+        )
+
+    def test_empty_pattern_is_ignored(self):
+        # An empty map key matches everything under `in`; it must not swallow input.
+        category_map = {"": "Bogus", "youtube": "Youtube"}
+        self.assertEqual(classify_title("youtube - Chrome", category_map), "Youtube")
+        self.assertEqual(classify_title("unrelated", category_map), "excluded")
 
 
 if __name__ == "__main__":
